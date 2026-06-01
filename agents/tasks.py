@@ -21,8 +21,8 @@ class AgentTask(BaseModel):
     )
     
     # Model Parameters (Different tasks require different models or strictness)
-    model_name: str = Field(
-        default="gpt-4o", 
+    model: str = Field(
+        default="gemini-2.0-flash", 
         description="The specific LLM to use for this task (e.g., 'gpt-4o', 'gemini-1.5-pro')."
     )
     temperature: float = Field(

@@ -7,7 +7,7 @@ from google import genai
 from google.genai import types
 
 from tasks import *
-from typing import List
+from typing import List, Union
 
 # =====================================================================
 # 2. Multimodal Agent Worker Implementation
@@ -59,72 +59,107 @@ class Agent:
                 
         return gemini_image_parts
 
-    def run_task(self, task:AgentTask, file: str) -> dict:
-        """Automatically aggregates text metadata maps and image assets to audit file logic."""
-        target_folder = self.artifact_base_dir / file
-        markdown_path = target_folder / "clean_document.md"
-        json_path = target_folder / "full_layout.json"
+    def run_task(self, task: AgentTask, files: Union[list[str], str]) -> dict:
+            """Aggregates multiple files, layout layers, and visual sheets into a single
 
-        if not markdown_path.exists() or not json_path.exists():
-            raise FileNotFoundError(f"Missing required Phase 1 output matrices inside {target_folder}")
-
-        # 1. Read document layers into workspace strings
-        with open(markdown_path, "r", encoding="utf-8") as f:
-            markdown_content = f.read()
-
-        with open(json_path, "r", encoding="utf-8") as f:
-            layout_content = f.read()
-
-        # 2. AUTOMATIC IMAGE HARVESTING PASS
-        # Automatically extracts, reads, and converts the saved .png files from disk memory
-        visual_assets = self._automatically_parse_and_load_images(markdown_content, target_folder)
-
-        # 4. Compile the Prompt Payload Array
-        # Standard texts and layout dictionary schema strings
-        contents_payload = [
-            f"""
-
-            --- TASK ---
-            {task.description}
-
-            {task.instruction}
-
-            --- DOCUMENT TEXT CONTENT LAYER ---
-            {markdown_content}
-            
-            --- SCHEMA STRUCTURE LAYOUT LAYER ---
-            {layout_content}
+            multimodal context pass, generating a unified cross-document audit report.
             """
-        ]
-        
-        # Dynamically append the gathered physical image binary blocks natively into the contents frame
-        contents_payload.extend(visual_assets)
 
-        print(contents_payload)
+            if isinstance(files, str):
+                files = [files]
 
-        print("-> Initializing model execution over combined multimodal matrices...")
-        
-        print(task)
-        
-        # Request strict Pydantic JSON schema generation from gemini-2.5-flash
-        response = self.client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=contents_payload,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                system_instruction=self.system_instruction,
-                response_schema=task.response_schema,
-                temperature=task.temperature# Zero variance for absolute analytical accuracy
+            if not files:
+                raise ValueError("The files / files batch array cannot be empty.")
+
+            contents_payload = [
+                f"""
+                --- GLOBAL TASK CONTEXT ---
+                {task.description}
+
+                {task.instruction}
+
+                You are auditing a collection of {len(files)} interconnected documents or layout sheets simultaneously. 
+                Analyze all provided text maps, dimensional parameters, and accompanying visual layouts collectively.
+                Your final JSON response must map your structural evaluations cleanly across all processed sources.
+                """
+            ]
+
+            print(f"-> Aggregating {len(files)} document matrices into a unified payload layer...")
+
+            # 1. Harvest and chain all document matrices into the single prompt array
+            for file_identifier in files:
+                target_folder = self.artifact_base_dir / file_identifier
+                markdown_path = target_folder / "clean_document.md"
+                json_path = target_folder / "full_layout.json"
+
+                if not markdown_path.exists() or not json_path.exists():
+                    print(f"[Warning] Skipping integration for {file_identifier}: Missing tracking artifacts.")
+                    continue
+
+                with open(markdown_path, "r", encoding="utf-8") as f:
+                    markdown_content = f.read()
+
+                with open(json_path, "r", encoding="utf-8") as f:
+                    layout_content = f.read()
+
+                # Append the text context segment for this specific file block
+                contents_payload.append(
+                    f"""
+                    ======================================================================
+                    START OF DOCUMENT REPOSITORY: {file_identifier}
+                    ======================================================================
+                    
+                    --- DOCUMENT TEXT CONTENT LAYER ({file_identifier}) ---
+                    {markdown_content}
+                    
+                    --- SCHEMA STRUCTURE LAYOUT LAYER ({file_identifier}) ---
+                    {layout_content}
+                    
+                    --- VISUAL ASSETS / IMAGES FOR {file_identifier} ---
+                    The images following this label belong exclusively to the document '{file_identifier}'.
+                    """
+                )
+
+                # 2. Extract this specific document's images
+                visual_assets = self._automatically_parse_and_load_images(markdown_content, target_folder)
+                
+                # Interleave them immediately after the text block for this specific file
+                for idx, asset in enumerate(visual_assets):
+                    contents_payload.append(f"[Image {idx + 1} for Document: {file_identifier}]")
+                    contents_payload.append(asset) # This is your raw image data block
+
+                contents_payload.append(
+                    f"""
+                    ======================================================================
+                    END OF DOCUMENT REPOSITORY: {file_identifier}
+                    ======================================================================
+                    """
+                )
+
+
+            print("-> Initializing cross-document aggregate multimodal model execution via gemini-2.5-flash...")
+
+            # 3. Fire a single request encompassing the entire structural ecosystem
+            response = self.client.models.generate_content(
+                model=task.model,
+                contents=contents_payload,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    system_instruction=self.system_instruction,
+                    response_schema=task.response_schema,  # Crucial: Ensure this schema expects grouped/mapped data
+                    temperature=task.temperature
+                )
             )
-        )
 
-        # Parse and dump audit data back onto local filesystem
-        report_data = json.loads(response.text)
-        report_data['task'] = task.name
-        output_report_path = target_folder / "multimodal_audit_report.json"
-        with open(output_report_path, "w", encoding="utf-8") as f:
-            json.dump(report_data, f, indent=2)
+            # 4. Process and store the unified master evaluation report
+            report_data = json.loads(response.text)
+            report_data['aggregated_batch_task'] = task.name
+            report_data['processed_sources'] = files
 
-        print(f"[Success] Multimodal Agent pass finished. Report compiled in: {output_report_path}")
-        return report_data
+            # Save standard reference copy in your base execution workspace
+            master_output_path = self.artifact_base_dir / "aggregated_multimodal_audit_report.json"
+            with open(master_output_path, "w", encoding="utf-8") as f:
+                json.dump(report_data, f, indent=2)
 
+            print(f"[Success] Aggregated execution finished. Consolidated data layout saved at: {master_output_path}")
+            return report_data
