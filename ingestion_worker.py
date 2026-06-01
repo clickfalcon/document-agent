@@ -217,7 +217,3 @@ class CloudDocumentIngestionWorker:
         except Exception as e:
             print(f"[Execution Failure] Processing pipeline faulted: {str(e)}")
             raise e
-
-if __name__ == "__main__":
-    worker = CloudDocumentIngestionWorker(output_base_dir="processed_artifacts")
-    worker.process_document(input_file_path="sample2.png", run_id="local-test-run-001")
