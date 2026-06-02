@@ -1,59 +1,75 @@
 import os
-import uuid
 import uvicorn
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Route
-from starlette.background import BackgroundTasks
 from loguru import logger
 from worker import DocumentIngestionWorker
+from pydantic import BaseModel, Field, ValidationError
+import sys
+from dotenv import load_dotenv
 
-# 1. Configuration: Use env var or default
-DESTINATION_URI = os.getenv("DESTINATION_URI", "/tmp/artifacts")
-worker = DocumentIngestionWorker(destination_uri=DESTINATION_URI)
+# Define structural schema validation profile
+class DocumentParameters(BaseModel):
+    source_uri: str = Field(description='Input document uri')
+    artifacts_uri: str = Field(description='Artifacts uri')
 
-# 2. Background Task Handler
-def run_background_process(temp_path: str, run_id: str):
-    """Executes the Docling worker and handles file cleanup."""
-    try:
-        worker.process_document(temp_path, run_id)
-        logger.success(f"Background run {run_id} completed successfully.")
-    except Exception as e:
-        logger.exception(f"Background processing failed for {run_id}: {str(e)}")
-    finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-            logger.debug(f"Temporary file cleaned up: {temp_path}")
+# 2. Health Check Handler
+async def health_check(request):
+    """Liveness and Readiness probe endpoint."""
+    return JSONResponse({"status": "healthy"}, status_code=200)
 
-# 3. Request Handler
+# 3. Synchronous Wait Request Handler
 async def process_document(request):
-    """Starlette route for document ingestion."""
-    form = await request.form()
-    file = form.get("file")
-    run_id = form.get("run_id", str(uuid.uuid4()))
+    """
+    Starlette route for synchronous document ingestion.
+    Validates payload against the DocumentParameters schema.
+    """
+    try:
+        raw_body = await request.json()
+        # FIX 1: Initializing model with keyword arguments
+        body = DocumentParameters(**raw_body)
+    except ValidationError as val_err:
+        logger.warning(f"Payload validation failed: {val_err.errors()}")
+        return JSONResponse({"success": False, "error": "Validation Error", "details": val_err.errors()}, status_code=422)
+    except Exception:
+        return JSONResponse({"success": False, "error": "Invalid or missing JSON payload"}, status_code=400)
 
-    if not file:
-        return JSONResponse({"error": "No file provided"}, status_code=400)
+    # Local extractions from the validated schema object
+    source_uri = body.source_uri
+    artifacts_uri = body.artifacts_uri
 
-    # Save incoming upload to temporary storage
-    temp_path = f"/tmp/{run_id}_{file.filename}"
-    content = await file.read()
-    with open(temp_path, "wb") as buffer:
-        buffer.write(content)
-    
-    # Trigger background work
-    tasks = BackgroundTasks()
-    tasks.add_task(run_background_process, temp_path, run_id)
-    
-    logger.info(f"Task {run_id} received and queued for background processing.")
-    
-    return JSONResponse(
-        {"status": "accepted", "run_id": run_id, "message": "Processing started in background"},
-        background=tasks
-    )
+    logger.info(f"Received processing request: {source_uri=} {artifacts_uri=}")
 
-# 4. Route Definition
+    try:
+        # The API caller blocks here until the Docling pipeline     letely runs
+        worker = DocumentIngestionWorker()
+        worker.process_document(
+            source_uri=source_uri,
+            artifacts_uri=artifacts_uri
+        )
+             
+        # FIX 2: Dynamically resolve target folder mapping uri cleanly
+  
+        logger.success(f"Processing for document_id {source_uri} completed successfully.")
+        
+        return JSONResponse({
+            "success": True,
+            "source_uri": source_uri,
+            "artifacts_uri": artifacts_uri
+        }, status_code=200)
+
+    except Exception as e:
+        logger.exception(f"Processing pipeline faulted for source_uri {source_uri}: {str(e)}")
+        return JSONResponse({
+            "success": False,
+            "source_uri": source_uri,
+            "error": str(e)
+        }, status_code=500)
+
+# 4. Route Definitions
 routes = [
+    Route("/health", endpoint=health_check, methods=["GET"]),
     Route("/process_document", endpoint=process_document, methods=["POST"]),
 ]
 

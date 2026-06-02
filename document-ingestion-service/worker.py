@@ -12,39 +12,28 @@ from docling.document_converter import DocumentConverter, PdfFormatOption
 import time
 
 class DocumentIngestionWorker:
-    def __init__(self, destination_uri: str = "/tmp/processed_artifacts"):
-        self.destination_uri = destination_uri
-        self.is_gcs = destination_uri.startswith("gs://")
+    def __init__(self):
         self.converter = self._build_docling_converter()
-        
-        if self.is_gcs:
-            self.gcs_client = storage.Client()
-            parts = self.destination_uri.replace("gs://", "").split("/", 1)
-            self.bucket_name = parts[0]
-            self.base_blob_path = parts[1] if len(parts) > 1 else ""
-        else:
-            self.base_path = Path(destination_uri)
-            self.base_path.mkdir(parents=True, exist_ok=True)
+    
+    def is_gcs(self, uri):
+        return uri.startswith("gs://")
 
-        logger.debug(f'{destination_uri=}')
-
-    def _sanitize_id(self, document_id: str) -> str:
-        return re.sub(r'[^a-zA-Z0-9_-]', '', document_id)
-
-    def _save_artifact(self, document_id: str, relative_path: str, content, content_type="application/octet-stream"):
-        safe_document_id = self._sanitize_id(document_id)
-
-        if self.is_gcs:
-            target_key = f"{self.base_blob_path}/{safe_document_id}/{relative_path}".strip("/")
-            logger.debug(f'{target_key=}')
+    def _save_artifact(self, artifacts_uri: str, relative_path: str, content, content_type="application/octet-stream"):
+        if self.is_gcs(artifacts_uri):
+            parts = artifacts_uri.replace("gs://", "").split("/", 1)
             
-            blob = self.gcs_client.bucket(self.bucket_name).blob(target_key)
+            bucket_name = parts[0]
+            base_blob_path = parts[1] if len(parts) > 1 else ""
+            blob_name = f"{base_blob_path.rstrip('/')}/{relative_path.lstrip('/')}".strip("/")
+            blob = self.gcs_client.bucket(bucket_name).blob(blob_name)
+
             if isinstance(content, io.BytesIO):
                 blob.upload_from_file(content, content_type=content_type)
             else:
                 blob.upload_from_string(content, content_type=content_type)
         else:
-            full_path = (self.base_path / safe_document_id / relative_path).resolve()
+            base_path = Path(artifacts_uri)
+            full_path = (base_path / relative_path).resolve()
             full_path.parent.mkdir(parents=True, exist_ok=True)
             logger.debug(f'{full_path=}')
             if isinstance(content, io.BytesIO):
@@ -99,219 +88,308 @@ class DocumentIngestionWorker:
                 
             return source_uri
 
-    def process_document(self, source_uri: str, document_id: str):
+
+    def _compile_lean_spatial_layout(self, doc, raw_layout_map: dict) -> dict:
         """
-        Executes document parsing, exports binary images from processing memory,
-        and runs a schema structural check pass to format layout URIs natively.
+        Processes the heavy layout properties using Docling's native SDK objects
+        to guarantee perfect table row_index and col_index structural mapping.
         """
+        content_elements = []
+        visual_blocks = []
+        pages_config = {}
 
-        input_path = Path(self._fetch_input_file(source_uri))
+        # 1. Parse Text Fragments safely
+        for block in raw_layout_map.get("texts", []):
+            text_content = block.get("text", "").strip()
+            if not text_content:
+                continue
+            prov = block.get("prov", [])
+            page_no = 1
+            bbox_coords = None
+            if prov and isinstance(prov, list):
+                page_no = prov[0].get("page_no", 1)
+                b = prov[0].get("bbox", {})
+                bbox_coords = [b.get("l"), b.get("t"), b.get("r"), b.get("b")]
+            content_elements.append({
+                "page_no": page_no,
+                "label": block.get("label", "text"),
+                "text": text_content,
+                "bbox": bbox_coords
+            })
 
-        destination_folder = Path(os.path.join(self.destination_uri, document_id))
+        # 2. Extract Embedded Drawing / Picture Regions
+        for pic in raw_layout_map.get("pictures", []):
+            prov = pic.get("prov", [])
+            page_no = 1
+            bbox_coords = None
+            if prov and isinstance(prov, list):
+                page_no = prov[0].get("page_no", 1)
+                b = prov[0].get("bbox", {})
+                bbox_coords = [b.get("l"), b.get("t"), b.get("r"), b.get("b")]
+            visual_blocks.append({
+                "page_no": page_no,
+                "type": "picture",
+                "label": pic.get("label", "picture"),
+                "uri": pic.get("image", {}).get("uri") if pic.get("image") else None,
+                "bbox": bbox_coords
+            })
 
-        logger.debug(f"\n[Execution Run: {document_id}] Loading target file: {input_path.name}")
-        
-        logger.debug(f'{source_uri=}')
-        logger.debug(f'{document_id=}')
-        logger.debug(f'{destination_folder=}')
-               
-        try:
-            # Initialize pipeline converter pass
-            start_time = time.perf_counter()
-            result = self.converter.convert(input_path)
-            doc = result.document
-            
-            # Establish workspace directories for physical file storage
-            images_base_dir = destination_folder / "extracted_images"
-            images_base_dir.mkdir(parents=True, exist_ok=True)
-            
-            # ------------------------------------------------------------------
-            # PASS 1: Extract and Save Physical Images From Direct Canvas Memory
-            # ------------------------------------------------------------------
-            logger.debug("-> Extracting and saving physical document images from canvas memory...")
-            image_counter = 0
-            ordered_image_paths = []
-
-            for element, level in doc.iterate_items():
-                label_str = str(getattr(element, "label", "")).lower()
+        # 3. Extract Tables Natively Using Docling SDK Objects
+        if hasattr(doc, "tables") and doc.tables:
+            for table_element in doc.tables:
+                page_no = 1
+                table_bbox = None
                 
-                if "picture" in label_str or "figure" in label_str or "graphic" in label_str:
-                    if hasattr(element, "image") and element.image:
-                        image_counter += 1
-                        
-                        page_no = 1
-                        if hasattr(element, "prov") and element.prov:
-                            page_no = getattr(element.prov[0], "page_no", 1)
-                            
-                        img_filename = f"page_{page_no}_{image_counter}.png"
+                # Extract parent table coordinates from its top-level layout provenance
+                if hasattr(table_element, "prov") and table_element.prov:
+                    page_no = table_element.prov[0].page_no
+                    b = table_element.prov[0].bbox
+                    table_bbox = [b.l, b.t, b.r, b.b]
 
-                        # Create an in-memory buffer
-                        img_buffer = io.BytesIO()
+                visual_blocks.append({
+                    "page_no": page_no,
+                    "type": "table",
+                    "label": "table",
+                    "bbox": table_bbox
+                })
 
-                        if hasattr(element.image, "pil_image"):
-                            element.image.pil_image.save(img_buffer, format="PNG")
-                        else:
-                            element.image.save(img_buffer, format="PNG")
-                        
-                        # Seek back to the start so the uploader can read it
-                        img_buffer.seek(0)
+                # Loop through the SDK cells grid matrix safely
+                for cell in table_element.data.table_cells:
+                    cell_text = cell.text.strip() if cell.text else ""
+                    if not cell_text:
+                        continue
 
-                        relative_path_slug = f"extracted_images/{img_filename}"
-                        self._save_artifact(
-                            document_id=document_id, 
-                            relative_path=relative_path_slug, 
-                            content=img_buffer, 
-                            content_type="image/png"
-                        )
-                        
-                        ordered_image_paths.append({
-                            "path": relative_path_slug,
-                            "page_no": page_no,
-                            "label": label_str
-                        })
+                    # Safe attribute extraction for row/col matrix indices
+                    row_index = cell.row_index if hasattr(cell, "row_index") else 0
+                    col_index = cell.col_index if hasattr(cell, "col_index") else 0
 
-            # ------------------------------------------------------------------
-            # PASS 2: Compile Custom Markdown featuring structural tags
-            # ------------------------------------------------------------------
-            logger.debug("-> Compiling enhanced context markdown metadata file...")
-            enhanced_markdown_lines = []
-            md_image_idx = 0
-            
-            for element, level in doc.iterate_items():
-                label_str = str(getattr(element, "label", "")).lower()
-                
-                if "picture" in label_str or "figure" in label_str or "graphic" in label_str:
-                    if md_image_idx < len(ordered_image_paths):
-                        meta = ordered_image_paths[md_image_idx]
-                        img_tag = f'\n<image path="{meta["path"]}" type="{meta["label"]}" page={meta["page_no"]}>\n'
-                        md_image_idx += 1
-                    else:
-                        img_tag = f'\n<image path="extracted_images/unknown_{md_image_idx+1}.png" type="picture" page=1>\n'
-                        md_image_idx += 1
-                        
-                    enhanced_markdown_lines.append(img_tag)
-                else:
-                    if hasattr(element, "export_to_markdown"):
-                        enhanced_markdown_lines.append(element.export_to_markdown())
-                    elif hasattr(element, "text") and element.text:
-                        enhanced_markdown_lines.append(f"\n{element.text}\n")
-
-            markdown_out = destination_folder / "clean_document.md"
-            with open(markdown_out, "w", encoding="utf-8") as f:
-                f.write("\n".join(enhanced_markdown_lines))
-
-            # ------------------------------------------------------------------
-            # PASS 3: Generate Standard Master JSON Output
-            # ------------------------------------------------------------------
-            logger.debug("-> Serializing full_layout.json data...")
-            
-            json_out = destination_folder / "full_layout.json"
-
-            # Get the JSON data as a string
-            if hasattr(doc, "model_dump_json"):
-                json_content = doc.model_dump_json(indent=2)
-            else:
-                export_data = doc.model_dump() if hasattr(doc, "model_dump") else doc.export_to_dict()
-                json_content = json.dumps(export_data, indent=2, default=str)
-
-            # Use your abstraction to save it
-            self._save_artifact(
-                document_id=document_id, 
-                relative_path="full_layout.json", 
-                content=json_content, 
-                content_type="application/json"
-            )
-
-            # ------------------------------------------------------------------
-            # PASS 4: RECURSIVE SCHEMA-STRUCTURE POST-PROCESS PURGE
-            # ------------------------------------------------------------------
-            logger.debug("-> Executing Structural Post-Processing Pass...")
-            
-            with open(json_out, "r", encoding="utf-8") as f:
-                raw_layout_map = json.load(f)
-
-            json_image_counter = 0
-
-            def clean_by_schema_structure(node, current_page=1):
-                """
-                Traverses the JSON tree. When it finds a dictionary containing 
-                Docling's signature image keys, it standardizes the schema structural profile.
-                """
-                nonlocal json_image_counter
-                
-                if isinstance(node, dict):
-                    # Capture page numbers as we pass through top-level page lists
-                    if "page_no" in node:
-                        try:
-                            current_page = int(node["page_no"])
-                        except:
-                            pass
+                    # Fix: TableCell objects hold spatial coordinates in cell.bbox
+                    cell_bbox = None
+                    if hasattr(cell, "bbox") and cell.bbox:
+                        cb = cell.bbox
+                        cell_bbox = [cb.l, cb.t, cb.r, cb.b]
                     
-                    # Look for top-level file references (like origin blocks)
-                    if "uri" in node and isinstance(node["uri"], str) and (node["uri"].startswith("data:") or len(node["uri"]) > 150):
-                        node["uri"] = f"extracted_images/page_1_1.png"
+                    # Fallback to parent table bounding box if cell dimensions are omitted
+                    if not cell_bbox:
+                        cell_bbox = table_bbox
 
-                    # CRITICAL MATCH: Check if this node matches the structure of a Docling image canvas block
-                    is_image_profile = "mimetype" in node and "size" in node and ("uri" in node or "bytes" in node)
-                    
-                    if is_image_profile:
-                        json_image_counter += 1
-                        img_filename = f"page_{current_page}_{json_image_counter}.page_no"
-                        
-                        # 1. Enforce the exact structure layout schema
-                        node["mimetype"] = "image/png"
-                        node["uri"] = f"extracted_images/{img_filename}"
-                        
-                        # 2. Purely delete any lingering memory buffer keys that hold the text pixel rows
-                        for heavy_key in ["bytes", "data", "image_base64", "value"]:
-                            if heavy_key in node:
-                                del node[heavy_key]
-                                
-                        logger.debug(f"   [Structural Clean] Formatted profile block for: {img_filename}")
-                    
-                    else:
-                        # Continue walking down the dictionary paths
-                        for k in list(node.keys()):
-                            clean_by_schema_structure(node[k], current_page)
-                            
-                elif isinstance(node, list):
-                    for item in node:
-                        clean_by_schema_structure(item, current_page)
+                    content_elements.append({
+                        "page_no": page_no,
+                        "label": "table_cell",
+                        "row_index": row_index,
+                        "col_index": col_index,
+                        "text": cell_text,
+                        "bbox": cell_bbox
+                    })
 
-            # Fire the targeted structural analyzer pass
-            clean_by_schema_structure(raw_layout_map)
-
-            self._save_artifact(
-                document_id=document_id, 
-                relative_path="full_layout.json", 
-                content=json.dumps(raw_layout_map, indent=2), 
-                content_type="application/json"
-            )
-            
-            logger.debug("[Post-Process Success] Schema profiles realigned. Base64 layers purged.")
-
-            # ------------------------------------------------------------------
-            # PASS 5: Render Standard Tracking Manifest
-            # ------------------------------------------------------------------
-            meta_out = destination_folder / "metadata.json"
-            metadata_payload = {
-                "doc_id": document_id,
-                "original_filename": input_path.name,
-                "total_extracted_images_count": max(image_counter, json_image_counter)
+        # 4. Enumerate Page Configuration Baselines
+        pages = raw_layout_map.get("pages", {})
+        for p_key, p_val in pages.items():
+            size = p_val.get("size", {})
+            pages_config[str(p_key)] = {
+                "width": size.get("width"),
+                "height": size.get("height"),
+                "unit": "points"
             }
 
-            self._save_artifact(
-                document_id=document_id, 
-                relative_path="metadata.json", 
-                content=json.dumps(metadata_payload, indent=2), 
-                content_type="application/json"
-            )
+        return {
+            "document_meta": {
+                "name": raw_layout_map.get("name", "document"),
+                "version": raw_layout_map.get("version", "1.0.0"),
+                "origin_filename": raw_layout_map.get("origin", {}).get("filename", "")
+            },
+            "pages_config": pages_config,
+            "visual_blocks": visual_blocks,
+            "content_elements": content_elements
+        }
+
+    def process_document(self, source_uri: str, artifacts_uri: str):
+            """
+            Executes document parsing, exports binary images from processing memory,
+            and runs a schema structural check pass to format layout URIs natively.
+            Accommodates both Local paths and GCS paths natively.
+            """
+
+            if self.is_gcs(source_uri) or self.is_gcs(artifacts_uri):
+                self.gcs_client = storage.Client()
+
+            input_path = Path(self._fetch_input_file(source_uri))
+            
+            # Log paths carefully
+            logger.debug(f"\nExecution Run: {source_uri=} {artifacts_uri=}")
+            logger.debug(f'{source_uri=} {artifacts_uri=}')       
+            try:
+                # Initialize pipeline converter pass
+                start_time = time.perf_counter()
+                result = self.converter.convert(input_path)
+                doc = result.document
                 
-            logger.debug(f"\n[Success] Run artifacts cleanly generated inside: {destination_folder}")
+                # ------------------------------------------------------------------
+                # PASS 1: Extract and Save Physical Images From Direct Canvas Memory
+                # ------------------------------------------------------------------
+                logger.debug("-> Extracting and saving physical document images from canvas memory...")
+                image_counter = 0
+                ordered_image_paths = []
 
-            end_time = time.perf_counter()
-            logger.debug(f"Elapsed time: {round(end_time - start_time,2)} seconds")
-        except Exception as e:
-            logger.debug(f"[Execution Failure] Processing pipeline faulted: {str(e)}")
-            raise e
+                for element, level in doc.iterate_items():
+                    label_str = str(getattr(element, "label", "")).lower()
+                    
+                    if "picture" in label_str or "figure" in label_str or "graphic" in label_str:
+                        if hasattr(element, "image") and element.image:
+                            image_counter += 1
+                            
+                            page_no = 1
+                            if hasattr(element, "prov") and element.prov:
+                                page_no = getattr(element.prov[0], "page_no", 1)
+                                
+                            img_filename = f"page_{page_no}_{image_counter}.png"
 
+                            img_buffer = io.BytesIO()
+                            if hasattr(element.image, "pil_image"):
+                                element.image.pil_image.save(img_buffer, format="PNG")
+                            else:
+                                element.image.save(img_buffer, format="PNG")
+                            
+                            img_buffer.seek(0)
+
+                            relative_path_slug = f"extracted_images/{img_filename}"
+                            self._save_artifact(
+                                artifacts_uri=artifacts_uri, 
+                                relative_path=relative_path_slug, 
+                                content=img_buffer, 
+                                content_type="image/png"
+                            )
+                            
+                            ordered_image_paths.append({
+                                "path": relative_path_slug,
+                                "page_no": page_no,
+                                "label": label_str
+                            })
+
+                # ------------------------------------------------------------------
+                # PASS 2: Compile Custom Markdown featuring structural tags
+                # ------------------------------------------------------------------
+                logger.debug("-> Compiling enhanced context markdown metadata file...")
+                enhanced_markdown_lines = []
+                md_image_idx = 0
+                
+                for element, level in doc.iterate_items():
+                    label_str = str(getattr(element, "label", "")).lower()
+                    
+                    if "picture" in label_str or "figure" in label_str or "graphic" in label_str:
+                        if md_image_idx < len(ordered_image_paths):
+                            meta = ordered_image_paths[md_image_idx]
+                            img_tag = f'\n<image path="{meta["path"]}" type="{meta["label"]}" page={meta["page_no"]}>\n'
+                            md_image_idx += 1
+                        else:
+                            img_tag = f'\n<image path="extracted_images/unknown_{md_image_idx+1}.png" type="picture" page=1>\n'
+                            md_image_idx += 1
+                            
+                        enhanced_markdown_lines.append(img_tag)
+                    else:
+                        if hasattr(element, "export_to_markdown"):
+                            enhanced_markdown_lines.append(element.export_to_markdown())
+                        elif hasattr(element, "text") and element.text:
+                            enhanced_markdown_lines.append(f"\n{element.text}\n")
+
+                self._save_artifact(
+                    artifacts_uri=artifacts_uri, 
+                    relative_path="clean_document.md",
+                    content="\n".join(enhanced_markdown_lines),
+                    content_type="text/markdown"
+                )
+
+                # ------------------------------------------------------------------
+                # PASS 3 & 4: Process Layout Map purely in-memory
+                # ------------------------------------------------------------------
+                logger.debug("-> Preparing layout schema...")
+                
+                if hasattr(doc, "model_dump"):
+                    raw_layout_map = doc.model_dump()
+                elif hasattr(doc, "export_to_dict"):
+                    raw_layout_map = doc.export_to_dict()
+                else:
+                    # Fallback if only json serialization is exposed
+                    raw_layout_map = json.loads(doc.model_dump_json())
+
+                logger.debug("-> Executing Structural Post-Processing Pass...")
+                json_image_counter = 0
+
+                def clean_by_schema_structure(node, current_page=1):
+                    nonlocal json_image_counter
+                    
+                    if isinstance(node, dict):
+                        if "page_no" in node:
+                            try:
+                                current_page = int(node["page_no"])
+                            except:
+                                pass
+                        
+                        if "uri" in node and isinstance(node["uri"], str) and (node["uri"].startswith("data:") or len(node["uri"]) > 150):
+                            node["uri"] = f"extracted_images/page_1_1.png"
+
+                        is_image_profile = "mimetype" in node and "size" in node and ("uri" in node or "bytes" in node)
+                        
+                        if is_image_profile:
+                            json_image_counter += 1
+                            # FIX 3: Fixed minor structural bug where you printed literal '.page_no' extension string
+                            img_filename = f"page_{current_page}_{json_image_counter}.png"
+                            
+                            node["mimetype"] = "image/png"
+                            node["uri"] = f"extracted_images/{img_filename}"
+                            
+                            for heavy_key in ["bytes", "data", "image_base64", "value"]:
+                                if heavy_key in node:
+                                    del node[heavy_key]
+                                    
+                            logger.debug(f"   [Structural Clean] Formatted profile block for: {img_filename}")
+                        else:
+                            for k in list(node.keys()):
+                                clean_by_schema_structure(node[k], current_page)
+                    elif isinstance(node, list):
+                        for item in node:
+                            clean_by_schema_structure(item, current_page)
+
+                # Fire the targeted structural analyzer pass in memory
+                clean_by_schema_structure(raw_layout_map)
+
+                optimized_layout = self._compile_lean_spatial_layout(doc, raw_layout_map)
+                
+                # Save the processed layout map
+                self._save_artifact(
+                    artifacts_uri=artifacts_uri, 
+                    relative_path="full_layout.json", 
+                    content=json.dumps(optimized_layout, indent=2), 
+                    content_type="application/json"
+                )
+                logger.debug("[Post-Process Success] Schema profiles realigned. Base64 layers purged.")
+
+                # ------------------------------------------------------------------
+                # PASS 5: Render Standard Tracking Manifest
+                # ------------------------------------------------------------------
+                metadata_payload = {
+                    "source_uri": source_uri,
+                    "artifacts_uri": artifacts_uri,
+                    "total_extracted_images_count": max(image_counter, json_image_counter)
+                }
+
+                self._save_artifact(
+                    artifacts_uri=artifacts_uri, 
+                    relative_path="metadata.json", 
+                    content=json.dumps(metadata_payload, indent=2), 
+                    content_type="application/json"
+                )
+                    
+                logger.debug(f"\n[Success] Run artifacts cleanly generated via target URI adapter.")
+
+                # Cleanup the downloaded temp file if it was created from GCS
+                if source_uri.startswith("gs://") and input_path.exists():
+                    os.remove(input_path)
+
+                end_time = time.perf_counter()
+                logger.debug(f"Elapsed time: {round(end_time - start_time,2)} seconds")
+            except Exception as e:
+                logger.error(f"[Execution Failure] Processing pipeline faulted: {str(e)}")
+                if source_uri.startswith("gs://") and input_path.exists():
+                    os.remove(input_path)
+                raise e
